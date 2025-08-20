@@ -15,6 +15,7 @@ using System.ComponentModel;
 using System.Net.Sockets;
 using System.Collections.Generic;
 using System.Data.OleDb;
+using System.IO;
 
 namespace subnetscan2nd
 {
@@ -36,6 +37,18 @@ namespace subnetscan2nd
 
         // Creazione DataTable per info Utenti, Computers
         readonly DataTable dt = new DataTable();
+
+        // Logging
+        readonly string logPath = "scanlog.txt";
+        readonly object logLock = new object();
+
+        void Log(string message)
+        {
+            lock (logLock)
+            {
+                File.AppendAllText(logPath, DateTime.Now + " - " + message + Environment.NewLine);
+            }
+        }
 
         public Form1()
         {
@@ -98,6 +111,7 @@ namespace subnetscan2nd
             // Salvo Argomento per scansione automatica si/no
             bool auto = (bool)e.Argument;
             int count = 0;
+            Log("[SCAN] Starting subnet scan");
 
             // Messaggio di Stato
             lblStatus.ForeColor = System.Drawing.Color.Green;
@@ -111,16 +125,25 @@ namespace subnetscan2nd
             backgroundWorker.ReportProgress(25);
 
             // Connessione al DB
-            _ = new Import.Utility();
-            string connection = "Data Source=SRVOMGES;Initial Catalog=DATASTAT01;Connect Timeout=500;Persist Security Info=True;User ID=TipesStat;Password=stp";
-            Import.DbUtility utDB = new Import.DbUtility(connection);
-            utDB.getConnection().Open();
+            try
+            {
+                _ = new Import.Utility();
+                string connection = "Data Source=SRVOMGES;Initial Catalog=DATASTAT01;Connect Timeout=500;Persist Security Info=True;User ID=TipesStat;Password=stp";
+                Import.DbUtility utDB = new Import.DbUtility(connection);
+                utDB.getConnection().Open();
+                Log("[DB] Connection opened");
 
-            // Query e Fill DataTable da Select
-            string queryId = "SELECT IP, PCName, Username FROM tbDailyPCInfo";
-            SqlCommand sqlId = utDB.createSqlCommand(queryId);
-            dt.Load(sqlId.ExecuteReader());
-            utDB.getConnection().Close();
+                // Query e Fill DataTable da Select
+                string queryId = "SELECT IP, PCName, Username FROM tbDailyPCInfo";
+                SqlCommand sqlId = utDB.createSqlCommand(queryId);
+                dt.Load(sqlId.ExecuteReader());
+                Log($"[DB] Loaded {dt.Rows.Count} records");
+                utDB.getConnection().Close();
+            }
+            catch (Exception ex)
+            {
+                Log($"[DB-ERROR] {ex.Message}");
+            }
 
             // Subnet
             string subnet = "";
@@ -154,7 +177,15 @@ namespace subnetscan2nd
                 ping.PingCompleted += new PingCompletedEventHandler(Ping_PingCompleted);
                 countdown.AddCount();
 
-                ping.SendAsync(subnet + subnetn, 100);
+                try
+                {
+                    ping.SendAsync(subnet + subnetn, 100, subnet + subnetn);
+                }
+                catch (Exception ex)
+                {
+                    Log($"[ERROR] {subnet + subnetn} eccezione: {ex.Message}");
+                    countdown.Signal();
+                }
             }
 
             countdown.Signal();
@@ -171,6 +202,7 @@ namespace subnetscan2nd
             // Aggiorno numero di Hosts Trovati
             count = dataGridView1.Rows.Count;
             label5.Text = count.ToString() + " Hosts";
+            Log($"[SCAN] Completed with {count} hosts");
 
             // Reset Timer 30 Minuti finale
             t.Stop();
@@ -198,30 +230,41 @@ namespace subnetscan2nd
         }
         private void Ping_PingCompleted(object sender, PingCompletedEventArgs e)
         {
-            Retry:
-            // Se l'IP Risponde allora
+            string ip = e.UserState as string ?? e.Reply?.Address?.ToString();
+        Retry:
             if (e.Reply.Status == IPStatus.Success)
             {
-                string address = e.Reply.Address.ToString();
+                Log($"[OK] {ip} risponde, RTT={e.Reply.RoundtripTime}ms");
                 try
                 {
-                    // Query per ricerca PCName e Username da GetDailyPCInfo
                     string pcname = (from DataRow dr in dt.Rows
-                                     where (string)dr["IP"] == address
+                                     where (string)dr["IP"] == ip
                                      select (string)dr["PCName"]).FirstOrDefault();
                     string username = (from DataRow dr in dt.Rows
-                                       where (string)dr["IP"] == address
+                                       where (string)dr["IP"] == ip
                                        select (string)dr["Username"]).FirstOrDefault();
 
-                    // Aggiunta di informazioni estratte all'elenco
                     if (pcname != null && username != null)
                     {
                         dataGridView1.Refresh();
-                        dataGridView1.Rows.Add(address, pcname, username);
+                        dataGridView1.Rows.Add(ip, pcname, username);
                         dataGridView1.Refresh();
+                        Log($"[DB] Host {ip} trovato nel DB");
+                    }
+                    else
+                    {
+                        Log($"[DB] Host {ip} non trovato nel DB");
                     }
                 }
-                catch (Exception ex) { goto Retry; }
+                catch (Exception ex)
+                {
+                    Log($"[ERROR] {ip} eccezione: {ex.Message}");
+                    goto Retry;
+                }
+            }
+            else
+            {
+                Log($"[FAIL] {ip} non risponde ({e.Reply.Status})");
             }
 
             countdown.Signal();
